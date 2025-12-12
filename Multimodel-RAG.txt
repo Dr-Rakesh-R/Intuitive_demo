@@ -1,0 +1,284 @@
+import os
+import io
+import base64
+from dotenv import load_dotenv
+import fitz  # PyMuPDF
+from PIL import Image
+import torch
+import numpy as np
+from transformers import CLIPProcessor, CLIPModel
+from sklearn.metrics.pairwise import cosine_similarity
+from langchain_core.documents import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from openai import AzureOpenAI
+from azure.identity import DefaultAzureCredential
+
+# -------------------------
+# Load env
+# -------------------------
+load_dotenv()  # load .env if present
+
+# ---------- Azure OpenAI + AD token provider setup ----------
+# You can set these via environment or keep the defaults below
+AZURE_OPENAI_ENDPOINT = os.getenv(
+    "AZURE_OPENAI_ENDPOINT",
+    "https://openai-aiattack-msa-001758-swedencentral-adi.openai.azure.com/",
+)
+DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5")  # change to your deployed model name
+API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+
+# Initialize DefaultAzureCredential (ensure you have authenticated appropriately)
+credential = DefaultAzureCredential()
+
+
+def bearer_token_provider():
+    """Return an access token string for the Cognitive Services scope."""
+    scope = "https://cognitiveservices.azure.com/.default"
+    token = credential.get_token(scope)
+    return token.token
+
+
+# Initialize AzureOpenAI client; uses azure_ad_token_provider for auth
+client = AzureOpenAI(
+    api_version=API_VERSION,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    azure_ad_token_provider=bearer_token_provider,
+)
+
+# ---------- CLIP model init ----------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# If you have network/SSL issues, you can set CLIP_MODEL_LOCAL_PATH to a local directory
+# where you've downloaded the model (from huggingface) and then load from that path.
+CLIP_MODEL_NAME = os.getenv("CLIP_MODEL_NAME", "openai/clip-vit-base-patch32")
+CLIP_MODEL_LOCAL_PATH = os.getenv("CLIP_MODEL_LOCAL_PATH", None)  # e.g. "/path/to/openai-clip-vit-base-patch32"
+
+try:
+    if CLIP_MODEL_LOCAL_PATH:
+        print(f"Loading CLIP model from local path: {CLIP_MODEL_LOCAL_PATH}")
+        clip_model = CLIPModel.from_pretrained(CLIP_MODEL_LOCAL_PATH).to(device)
+        clip_processor = CLIPProcessor.from_pretrained(CLIP_MODEL_LOCAL_PATH)
+    else:
+        print(f"Downloading/loading CLIP model '{CLIP_MODEL_NAME}' from Hugging Face...")
+        clip_model = CLIPModel.from_pretrained(CLIP_MODEL_NAME).to(device)
+        clip_processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME)
+    clip_model.eval()
+    print("CLIP model ready on device:", device)
+except Exception as e:
+    # If you get here, it's likely an SSL / network error or resource problem.
+    import traceback
+
+    traceback.print_exc()
+    raise RuntimeError(
+        f"Failed to download or load CLIP model '{CLIP_MODEL_NAME}'. "
+        "If you are offline / behind a proxy, either set CLIP_MODEL_LOCAL_PATH to a local folder "
+        "containing the model files or resolve your network/CA issues. Original exception: "
+        + repr(e)
+    ) from e
+
+# ---------- Embedding helpers ----------
+def embed_image(image):
+    """Return normalized CLIP image embedding as 1D numpy array."""
+    if not isinstance(image, Image.Image):
+        image = Image.open(image).convert("RGB")
+    inputs = clip_processor(images=image, return_tensors="pt")
+    # move tensors to device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        feats = clip_model.get_image_features(**inputs)
+        feats = feats / feats.norm(dim=-1, keepdim=True)
+    return feats.squeeze(0).cpu().numpy()
+
+
+def embed_text(text):
+    """Return normalized CLIP text embedding as 1D numpy array."""
+    # CLIP processor expects a list for multiple texts; for single text use [text]
+    inputs = clip_processor(text=[text], return_tensors="pt", padding=True, truncation=True, max_length=77)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        feats = clip_model.get_text_features(**inputs)
+        feats = feats / feats.norm(dim=-1, keepdim=True)
+    return feats.squeeze(0).cpu().numpy()
+
+
+# ---------- PDF processing (extract text + images, compute embeddings) ----------
+PDF_PATH = os.getenv("PDF_PATH", "multimodal_sample.pdf")  # adjust path as needed
+
+if not os.path.exists(PDF_PATH):
+    raise FileNotFoundError(f"PDF file not found at: {PDF_PATH}")
+
+print("Opening PDF:", PDF_PATH)
+doc = fitz.open(PDF_PATH)
+
+all_docs = []            # list of Document objects
+all_embeddings = []      # list of numpy embeddings (1D arrays)
+image_data_store = {}    # image_id -> base64 PNG
+
+splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+
+print("Processing PDF pages...")
+for page_num, page in enumerate(doc):
+    # Extract text
+    text = page.get_text().strip()
+    if text:
+        temp_doc = Document(page_content=text, metadata={"page": page_num, "type": "text"})
+        text_chunks = splitter.split_documents([temp_doc])
+        for chunk in text_chunks:
+            try:
+                emb = embed_text(chunk.page_content)
+            except Exception as e:
+                print(f"  Warning: error embedding text on page {page_num}: {e}")
+                continue
+            all_embeddings.append(emb)
+            all_docs.append(chunk)
+
+    # Extract images
+    for img_index, img in enumerate(page.get_images(full=True)):
+        try:
+            xref = img[0]
+            base_image = doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+            image_id = f"page_{page_num}_img_{img_index}"
+            # store base64 PNG for direct embedding in chat message
+            buffered = io.BytesIO()
+            pil_image.save(buffered, format="PNG")
+            img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+            image_data_store[image_id] = img_b64
+
+            # compute CLIP image embedding
+            emb = embed_image(pil_image)
+            all_embeddings.append(emb)
+
+            image_doc = Document(
+                page_content=f"[Image: {image_id}]",
+                metadata={"page": page_num, "type": "image", "image_id": image_id},
+            )
+            all_docs.append(image_doc)
+        except Exception as e:
+            print(f"  Warning: error processing image {img_index} on page {page_num}: {e}")
+            continue
+
+doc.close()
+print(f"Finished processing PDF. Found {len(all_docs)} items (text chunks + images).")
+
+if len(all_embeddings) == 0:
+    raise RuntimeError("No embeddings were produced. Check the PDF and CLIP initialization.")
+
+# Create embeddings matrix (n x d)
+embeddings_matrix = np.vstack([np.asarray(e).reshape(1, -1) for e in all_embeddings])
+
+# ---------- Retrieval ----------
+def retrieve_multimodal(query, k=5):
+    """Return top-k Document objects most similar to query (using CLIP text embedding)."""
+    q_emb = embed_text(query).reshape(1, -1)
+    sims = cosine_similarity(q_emb, embeddings_matrix).squeeze(0)  # shape (n,)
+    top_idxs = np.argsort(sims)[::-1][:k]
+    results = [all_docs[i] for i in top_idxs]
+    return results, top_idxs, sims[top_idxs]
+
+
+# ---------- Build chat message content ----------
+def build_message_content(query, retrieved_docs):
+    """
+    Build a single string containing the user's question, text context,
+    and inlined images (data URLs).
+    """
+    parts = []
+    parts.append("Question: " + query + "\n\nContext:\n")
+
+    text_docs = [d for d in retrieved_docs if d.metadata.get("type") == "text"]
+    image_docs = [d for d in retrieved_docs if d.metadata.get("type") == "image"]
+
+    if text_docs:
+        parts.append("Text excerpts:\n")
+        for d in text_docs:
+            page = d.metadata.get("page", "?")
+            excerpt = d.page_content.strip()
+            if len(excerpt) > 800:
+                excerpt = excerpt[:800] + "..."
+            parts.append(f"[Page {page}]: {excerpt}\n\n")
+
+    if image_docs:
+        parts.append("\nImages:\n")
+        for d in image_docs:
+            page = d.metadata.get("page", "?")
+            img_id = d.metadata.get("image_id")
+            if img_id and img_id in image_data_store:
+                data_url = f"data:image/png;base64,{image_data_store[img_id]}"
+                # Markdown image; many multimodal deployments accept data URLs inline
+                parts.append(f"![Image {img_id} (page {page})]({data_url})\n\n")
+            else:
+                parts.append(f"[Image {img_id} from page {page} not found]\n\n")
+
+    parts.append("\nPlease answer the question based on the provided text and images. Be concise but thorough.")
+    return "".join(parts)
+
+
+# ---------- Query pipeline using AzureOpenAI chat completions ----------
+def multimodal_pdf_rag_pipeline(query, k=5, max_tokens=1024):
+    retrieved_docs, idxs, sims = retrieve_multimodal(query, k=k)
+    content = build_message_content(query, retrieved_docs)
+
+    messages = [
+        {"role": "system", "content": "You are a helpful multimodal assistant. Use the provided text and images to answer the question."},
+        {"role": "user", "content": content},
+    ]
+
+    # Call Azure OpenAI chat completions (DO NOT pass temperature here unless your deployment supports it)
+    response = client.chat.completions.create(
+        model=DEPLOYMENT_NAME,
+        messages=messages,
+        max_completion_tokens=max_tokens,
+    )
+
+    assistant_msg = ""
+    try:
+        assistant_msg = response.choices[0].message.content
+    except Exception:
+        assistant_msg = str(response)
+
+    # Print retrieved context summary
+    print(f"\nRetrieved {len(retrieved_docs)} documents (top {k}):")
+    for rank, (d, idx, sim) in enumerate(zip(retrieved_docs, idxs, sims), start=1):
+        doc_type = d.metadata.get("type", "unknown")
+        page = d.metadata.get("page", "?")
+        if doc_type == "text":
+            preview = d.page_content[:200].replace("\n", " ")
+            print(f"  {rank}. Text (page {page}) -- sim={sim:.4f} -- preview: {preview[:120]}...")
+        else:
+            print(f"  {rank}. Image (page {page}) -- sim={sim:.4f} -- id: {d.metadata.get('image_id')}")
+
+    return assistant_msg
+
+
+# ---------- Example usage ----------
+if __name__ == "__main__":
+    queries = [
+        "What does the chart on page 1 show about revenue trends?",
+        "Summarize the main findings from the document",
+        "What visual elements are present in the document?",
+    ]
+
+    for q in queries:
+        print("\n" + "=" * 80)
+        print("Query:", q)
+        print("-" * 80)
+        try:
+            answer = multimodal_pdf_rag_pipeline(q, k=5, max_tokens=1024)
+            print("\nAnswer:\n", answer)
+        except Exception as e:
+            print("Error during pipeline:", e)
+            # If it's an SSL error on model download, give guidance
+            if "CERTIFICATE_VERIFY_FAILED" in str(e) or "SSL" in str(e):
+                print(
+                    "\nIt looks like an SSL certificate verification error occurred. "
+                    "Ensure certifi is installed (pip install certifi) and that the "
+                    "environment variables REQUESTS_CA_BUNDLE and SSL_CERT_FILE point "
+                    "to a valid CA bundle (the script already sets them to certifi). "
+                    "If you are behind a corporate proxy, set HTTPS_PROXY/HTTP_PROXY and "
+                    "point SSL_CERT_FILE to your company's CA .pem file."
+                )
+            # continue to next query
+            continue

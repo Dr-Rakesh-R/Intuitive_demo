@@ -1,0 +1,1273 @@
+import json
+import boto3
+import logging
+import re
+import uuid
+import os
+import asyncio
+from typing import List, Dict, Any, Optional, Union, Tuple
+from pydantic import BaseModel, Field
+from dataclasses import dataclass, field
+from botocore.exceptions import ClientError
+from langchain.agents import Tool, AgentExecutor, BaseSingleActionAgent, LLMSingleActionAgent
+from langchain.agents.agent_types import AgentType
+from langchain.chains import LLMChain, ConversationChain
+from langchain.schema import Document, AgentAction, AgentFinish
+from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
+from langchain.callbacks.manager import CallbackManager
+from langchain.prompts import PromptTemplate, ChatPromptTemplate, MessagesPlaceholder
+from langchain.memory import ConversationBufferMemory
+from langchain.tools import BaseTool, DuckDuckGoSearchRun
+from langchain.schema.runnable import Runnable, RunnablePassthrough
+from langchain.graphs import NetworkxEntityGraph
+from langchain.embeddings.bedrock import BedrockEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.llms.bedrock import Bedrock
+from langchain.experimental.plan_and_execute import PlanAndExecute, load_agent_executor, load_chat_planner
+import networkx as nx
+from pyvis.network import Network
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Define knowledge base for domain-specific agent
+BFSI_KNOWLEDGE = """
+This agent is an expert in Banking, Financial Services, Insurance (BFSI), AWS Cloud, and Terraform.
+It can answer questions about:
+- Banking regulations, products, and services
+- Financial markets, investments, and analysis
+- Insurance policies, claims, and risk management
+- AWS cloud services, architecture, and best practices
+- Terraform infrastructure as code, modules, and deployment
+"""
+
+# AWS knowledge for enriched context
+AWS_KNOWLEDGE = """
+AWS (Amazon Web Services) provides cloud computing infrastructure and services:
+- Compute: EC2, Lambda, ECS, EKS, Batch, Lightsail
+- Storage: S3, EBS, EFS, Glacier, Storage Gateway
+- Database: RDS, DynamoDB, ElastiCache, Neptune, Redshift
+- Networking: VPC, CloudFront, Route 53, API Gateway, Direct Connect
+- Security: IAM, GuardDuty, Inspector, KMS, WAF, Shield
+"""
+
+# Terraform knowledge for enriched context
+TERRAFORM_KNOWLEDGE = """
+Terraform is an Infrastructure as Code (IaC) tool that enables:
+- Declarative configuration syntax
+- Resource graph for dependency management
+- Plan and apply workflow
+- State management
+- Provider ecosystem for multi-cloud deployments
+- Module system for reusable components
+"""
+
+# Define default basic Lambda function code
+DEFAULT_PYTHON_LAMBDA_CODE = """
+def lambda_handler(event, context):
+    print('Lambda function executed successfully')
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Hello from Lambda!')
+    }
+"""
+
+# Initialize Bedrock configuration
+bedrock_region = 
+CLAUDE_MODEL_ID = 
+
+# Initialize knowledge graph 
+class KnowledgeGraphManager:
+    """Manages knowledge graph for entity relationships in BFSI/AWS/Terraform domains"""
+    
+    def __init__(self):
+        self.graph = NetworkxEntityGraph()
+        self._initialize_base_graph()
+    
+    def _initialize_base_graph(self):
+        """Initialize the graph with core concepts and relationships"""
+        # Add AWS services
+        aws_services = ["S3", "Lambda", "EC2", "RDS", "DynamoDB", "VPC", "IAM", "CloudWatch"]
+        for service in aws_services:
+            self.graph.add_node(service, node_type="aws_service")
+        
+        # Add BFSI domains
+        bfsi_domains = ["Banking", "Financial Services", "Insurance", "Risk Management", "Compliance"]
+        for domain in bfsi_domains:
+            self.graph.add_node(domain, node_type="bfsi_domain")
+        
+        # Add Terraform concepts
+        terraform_concepts = ["Provider", "Module", "Resource", "Data Source", "State", "Plan"]
+        for concept in terraform_concepts:
+            self.graph.add_node(concept, node_type="terraform_concept")
+        
+        # Add core relationships
+        relationships = [
+            ("Lambda", "stores data in", "S3"),
+            ("Lambda", "monitored by", "CloudWatch"),
+            ("EC2", "connected to", "VPC"),
+            ("RDS", "secured by", "IAM"),
+            ("Banking", "uses", "S3"),
+            ("Insurance", "uses", "DynamoDB"),
+            ("Financial Services", "uses", "Lambda"),
+            ("Risk Management", "uses", "CloudWatch"),
+            ("Terraform", "manages", "S3"),
+            ("Module", "contains", "Resource"),
+            ("Provider", "implements", "AWS")
+        ]
+        
+        for source, relation, target in relationships:
+            self.graph.add_edge(source, target, relation=relation)
+    
+    def query_related_entities(self, entity, relation=None):
+        """Find entities related to the given entity"""
+        if entity not in self.graph.get_nodes():
+            return []
+        
+        related = []
+        nx_graph = self.graph.get_networkx_graph()
+        
+        if relation:
+            for s, t, r in nx_graph.edges(data="relation"):
+                if (s == entity and r == relation) or (t == entity and r == relation):
+                    related.append((s if t == entity else t, r))
+        else:
+            for s, t, r in nx_graph.edges(data="relation"):
+                if s == entity:
+                    related.append((t, r))
+                elif t == entity:
+                    related.append((s, r))
+        
+        return related
+    
+    def find_path(self, source, target):
+        """Find path between two entities in the graph"""
+        if source not in self.graph.get_nodes() or target not in self.graph.get_nodes():
+            return None
+        
+        nx_graph = self.graph.get_networkx_graph()
+        try:
+            path = nx.shortest_path(nx_graph, source, target)
+            return path
+        except nx.NetworkXNoPath:
+            return None
+            
+    def visualize(self):
+        """Generate visualization of the knowledge graph"""
+        nx_graph = self.graph.get_networkx_graph()
+        net = Network(height="600px", width="100%", notebook=True)
+        
+        # Add nodes with colors based on type
+        for node, attrs in nx_graph.nodes(data=True):
+            node_type = attrs.get("node_type", "default")
+            if node_type == "aws_service":
+                color = "#FF9900"  # AWS orange
+            elif node_type == "bfsi_domain":
+                color = "#0033A0"  # Finance blue
+            elif node_type == "terraform_concept":
+                color = "#7B42BC"  # Terraform purple
+            else:
+                color = "#CCCCCC"  # Default gray
+                
+            net.add_node(node, label=node, color=color)
+        
+        # Add edges with relation labels
+        for source, target, data in nx_graph.edges(data=True):
+            relation = data.get("relation", "related")
+            net.add_edge(source, target, title=relation)
+        
+        return net
+
+# Initialize Bedrock client for Claude integration
+class BedrockLLMFactory:
+    """Factory for creating Bedrock LLM instances"""
+    
+    @staticmethod
+    def create_llm(model_id=CLAUDE_MODEL_ID, temperature=0, max_tokens=1000):
+        """Create a Bedrock LLM instance for use with LangChain"""
+        bedrock_client = boto3.client(
+            service_name= ,
+            region_name=bedrock_region
+        )
+        
+        callback_manager = CallbackManager([StreamingStdOutCallbackHandler()])
+        
+        llm = Bedrock(
+            client=bedrock_client,
+            model_id=model_id,
+            model_kwargs={
+                "anthropic_version": ,
+                "temperature": temperature,
+                "max_tokens_to_sample": max_tokens
+            },
+            streaming=True,
+            callback_manager=callback_manager
+        )
+        
+        return llm
+    
+    @staticmethod
+    def create_embeddings():
+        """Create Bedrock embeddings for vector operations"""
+        bedrock_client = boto3.client(
+            service_name="bedrock-runtime",
+            region_name=bedrock_region
+        )
+        
+        embeddings = BedrockEmbeddings(
+            client=bedrock_client,
+            model_id=
+        )
+        
+        return embeddings
+
+# Create knowledge base as vector store
+class KnowledgeBaseFactory:
+    """Factory for creating and managing knowledge bases"""
+    
+    @staticmethod
+    def create_vector_store():
+        """Create a vector store from domain knowledge"""
+        # Combine all knowledge sources
+        docs = [
+            Document(page_content=BFSI_KNOWLEDGE, metadata={"source": }),
+            Document(page_content=AWS_KNOWLEDGE, metadata={"source": }),
+            Document(page_content=TERRAFORM_KNOWLEDGE, metadata={"source": "terraform_base"})
+        ]
+        
+        # Split text into chunks
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=50
+        )
+        splits = text_splitter.split_documents(docs)
+        
+        # Create vector store
+        embeddings = BedrockLLMFactory.create_embeddings()
+        vector_store = FAISS.from_documents(splits, embeddings)
+        
+        return vector_store
+
+# Custom tool for S3 bucket creation
+class S3BucketCreatorTool(BaseTool):
+    """Tool for creating S3 buckets in AWS"""
+    
+    name = "s3_bucket_creator"
+    description = "Creates an S3 bucket with the specified name. Input should be the bucket name or a JSON with bucket_name key."
+    
+    def _run(self, bucket_name_input: str) -> str:
+        """Execute bucket creation"""
+        try:
+            # Parse input (could be plain text or JSON)
+            if bucket_name_input.strip().startswith("{"):
+                try:
+                    input_data = json.loads(bucket_name_input)
+                    bucket_name = input_data.get("bucket_name")
+                except:
+                    bucket_name = bucket_name_input.strip()
+            else:
+                bucket_name = bucket_name_input.strip()
+            
+            # Validate bucket name
+            if not bucket_name:
+                return "Error: No bucket name provided"
+            
+            # Call bucket creation handler
+            result = create_s3_bucket_handler({"bucket_name": bucket_name}, None)
+            
+            if result["statusCode"] == 200:
+                bucket_data = json.loads(result["body"])
+                return f"Successfully created S3 bucket: {bucket_data['bucket_name']}"
+            else:
+                return f"Error creating S3 bucket: {result['body']}"
+                
+        except Exception as e:
+            logger.error(f"Error in S3 bucket creation: {str(e)}")
+            return f"Error creating S3 bucket: {str(e)}"
+    
+    async def _arun(self, bucket_name_input: str) -> str:
+        """Async implementation"""
+        return self._run(bucket_name_input)
+
+# Custom tool for Lambda function creation
+class LambdaFunctionCreatorTool(BaseTool):
+    """Tool for creating Lambda functions in AWS"""
+    
+    name = "lambda_function_creator"
+    description = """Creates an AWS Lambda function. Input should be a JSON string with:
+    - function_name: name for the Lambda function
+    - runtime: runtime like python3.12, nodejs20.x, etc.
+    - architecture (optional): x86_64 or arm64"""
+    
+    def _run(self, lambda_input: str) -> str:
+        """Execute Lambda function creation"""
+        try:
+            # Parse input as JSON
+            try:
+                input_data = json.loads(lambda_input)
+            except:
+                return "Error: Input must be valid JSON with function_name and runtime"
+            
+            # Extract parameters
+            function_name = input_data.get("function_name")
+            runtime = input_data.get("runtime")
+            architecture = input_data.get("architecture", "x86_64")
+            
+            # Validate required parameters
+            if not function_name:
+                return "Error: function_name is required"
+            if not runtime:
+                return "Error: runtime is required"
+            
+            # Call Lambda creation handler
+            event = {
+                "function_name": function_name,
+                "runtime": runtime,
+                "architecture": architecture
+            }
+            
+            result = create_lambda_function_handler(event, None)
+            
+            if result["statusCode"] == 200:
+                function_data = json.loads(result["body"])
+                return f"Successfully created Lambda function: {function_data['function_name']} with runtime {function_data['runtime']}"
+            else:
+                return f"Error creating Lambda function: {result['body']}"
+                
+        except Exception as e:
+            logger.error(f"Error in Lambda function creation: {str(e)}")
+            return f"Error creating Lambda function: {str(e)}"
+    
+    async def _arun(self, lambda_input: str) -> str:
+        """Async implementation"""
+        return self._run(lambda_input)
+
+# Knowledge graph query tool
+class KnowledgeGraphTool(BaseTool):
+    """Tool for querying the knowledge graph"""
+    
+    name = "knowledge_graph_query"
+    description = """Query the domain knowledge graph to find relationships.
+    Input should be a JSON string with either:
+    - entity: name of entity to get related entities
+    - source and target: to find path between entities"""
+    
+    def __init__(self, knowledge_graph):
+        """Initialize with a knowledge graph instance"""
+        super().__init__()
+        self.kg = knowledge_graph
+    
+    def _run(self, query_input: str) -> str:
+        """Execute knowledge graph query"""
+        try:
+            # Parse input as JSON
+            try:
+                input_data = json.loads(query_input)
+            except:
+                return "Error: Input must be valid JSON with entity or source/target"
+            
+            # Handle single entity query
+            if "entity" in input_data:
+                entity = input_data["entity"]
+                relation = input_data.get("relation")
+                
+                related = self.kg.query_related_entities(entity, relation)
+                
+                if not related:
+                    return f"No related entities found for {entity}"
+                
+                result = f"Entities related to {entity}:\n"
+                for target, rel in related:
+                    result += f"- {target} ({rel})\n"
+                
+                return result
+            
+            # Handle path finding
+            elif "source" in input_data and "target" in input_data:
+                source = input_data["source"]
+                target = input_data["target"]
+                
+                path = self.kg.find_path(source, target)
+                
+                if not path:
+                    return f"No path found between {source} and {target}"
+                
+                result = f"Path from {source} to {target}:\n"
+                for i in range(len(path) - 1):
+                    nx_graph = self.kg.graph.get_networkx_graph()
+                    edge_data = nx_graph.get_edge_data(path[i], path[i+1])
+                    relation = edge_data.get("relation", "related to")
+                    result += f"{path[i]} --{relation}--> {path[i+1]}\n"
+                
+                return result
+            
+            else:
+                return "Error: Input must contain entity or source/target"
+                
+        except Exception as e:
+            logger.error(f"Error in knowledge graph query: {str(e)}")
+            return f"Error querying knowledge graph: {str(e)}"
+    
+    async def _arun(self, query_input: str) -> str:
+        """Async implementation"""
+        return self._run(query_input)
+
+# Agent for specialized domain queries
+class DomainExpertAgent:
+    """Agent specialized in BFSI, AWS, and Terraform domains"""
+    
+    def __init__(self):
+        # Initialize LLM and knowledge sources
+        self.llm = BedrockLLMFactory.create_llm(temperature=0.2)
+        self.vector_store = KnowledgeBaseFactory.create_vector_store()
+        self.kg = KnowledgeGraphManager()
+        
+        # Initialize tools
+        self.search_tool = DuckDuckGoSearchRun()
+        self.kg_tool = KnowledgeGraphTool(self.kg)
+        
+        # Setup memory and state
+        self.memory = ConversationBufferMemory(
+            return_messages=True,
+            memory_key="chat_history",
+            output_key="output"
+        )
+        
+        # Create chain with tools
+        self.tools = [
+            Tool(
+                name="domain_knowledge_search",
+                func=self._search_knowledge_base,
+                description="Search for information about BFSI, AWS, and Terraform domains"
+            ),
+            Tool(
+                name="web_search",
+                func=self.search_tool.run,
+                description="Search the web for recent information about financial services, AWS, or Terraform"
+            ),
+            self.kg_tool
+        ]
+        
+        # Setup prompt template
+        self.prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are a domain expert in Banking, Financial Services, Insurance, AWS Cloud, and Terraform.
+            Use your expertise and the available tools to provide accurate, helpful information.
+            Always consider security, compliance, and best practices in your responses."""),
+            MessagesPlaceholder(variable_name="chat_history"),
+            ("human", "{input}"),
+            MessagesPlaceholder(variable_name="agent_scratchpad")
+        ])
+        
+        # Create plan-and-execute agent
+        self.planner = load_chat_planner(self.llm)
+        self.executor = load_agent_executor(
+            self.llm, 
+            self.tools, 
+            verbose=True
+        )
+        self.agent_chain = PlanAndExecute(
+            planner=self.planner,
+            executor=self.executor,
+            verbose=True
+        )
+    
+    def _search_knowledge_base(self, query):
+        """Search the vector knowledge base"""
+        docs = self.vector_store.similarity_search(query, k=3)
+        content = "\n\n".join([doc.page_content for doc in docs])
+        return content
+    
+    def respond(self, query):
+        """Process query and generate response"""
+        try:
+            # Get a plan and execute it
+            response = self.agent_chain.invoke({
+                "input": query,
+                "chat_history": self.memory.buffer
+            })
+            
+            # Update memory
+            self.memory.save_context({"input": query}, {"output": response["output"]})
+            
+            return {
+                "agent": "domain_expert",
+                "answer": response["output"]
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in domain expert agent: {str(e)}")
+            return {
+                "agent": "domain_expert",
+                "answer": "I encountered an error processing your domain query. Please try asking in a different way.",
+                "error": str(e)
+            }
+
+# S3 Bucket Creator Agent
+class S3BucketCreatorAgent:
+    """Agent specialized in creating S3 buckets"""
+    
+    def __init__(self):
+        # Initialize LLM and tools
+        self.llm = BedrockLLMFactory.create_llm(temperature=0.1)
+        self.s3_tool = S3BucketCreatorTool()
+        self.search_tool = DuckDuckGoSearchRun()
+        self.kg = KnowledgeGraphManager()
+        self.kg_tool = KnowledgeGraphTool(self.kg)
+        
+        # Setup memory
+        self.memory = ConversationBufferMemory(
+            return_messages=True,
+            memory_key="chat_history",
+            output_key="output"
+        )
+        
+        # Create tools list
+        self.tools = [
+            self.s3_tool,
+            Tool(
+                name="s3_best_practices",
+                func=self._get_s3_best_practices,
+                description="Get best practices for S3 bucket configuration and security"
+            ),
+            Tool(
+                name="web_search",
+                func=self.search_tool.run,
+                description="Search the web for information about S3 buckets"
+            ),
+            self.kg_tool
+        ]
+        
+        # Setup prompt template
+        self.prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are an expert in AWS S3 bucket creation and management.
+            Extract bucket names from user requests and create secure, properly configured buckets.
+            Always follow AWS best practices for naming and security."""),
+            MessagesPlaceholder(variable_name="chat_history"),
+            ("human", "{input}"),
+            MessagesPlaceholder(variable_name="agent_scratchpad")
+        ])
+        
+        # Create agent chain
+        self.planner = load_chat_planner(self.llm)
+        self.executor = load_agent_executor(
+            self.llm, 
+            self.tools, 
+            verbose=True
+        )
+        self.agent_chain = PlanAndExecute(
+            planner=self.planner,
+            executor=self.executor,
+            verbose=True
+        )
+    
+    def _get_s3_best_practices(self, _):
+        """Return S3 bucket best practices"""
+        return """S3 Bucket Best Practices:
+1. Block all public access unless explicitly required
+2. Enable server-side encryption by default
+3. Enable versioning for critical buckets
+4. Configure lifecycle policies for cost optimization
+5. Use IAM policies with least privilege principles
+6. Enable access logging for audit purposes
+7. Use S3 Object Lock for WORM compliance if needed
+8. Implement cross-region replication for disaster recovery"""
+    
+    def _extract_bucket_name(self, query):
+        """Extract bucket name from the query"""
+        # Use the LLM to extract the bucket name
+        extraction_prompt = f"""
+        Extract the S3 bucket name from the following query. 
+        If no specific bucket name is mentioned, respond with "NO_NAME_FOUND".
+        
+        Query: {query}
+        
+        Respond with just the bucket name or "NO_NAME_FOUND".
+        """
+        
+        extraction_chain = LLMChain(
+            llm=self.llm,
+            prompt=PromptTemplate(
+                template=extraction_prompt,
+                input_variables=[]
+            )
+        )
+        
+        bucket_name = extraction_chain.run({})
+        bucket_name = bucket_name.strip()
+        
+        if bucket_name == "NO_NAME_FOUND":
+            return None
+        
+        return bucket_name
+    
+    def respond(self, query):
+        """Process query and create S3 bucket"""
+        try:
+            # Check if we need to extract a bucket name
+            if "bucket_name" in query.lower() and "what" in query.lower():
+                return {
+                    "agent": "s3_creator",
+                    "answer": "I'll help you create an S3 bucket. What would you like to name your bucket? (Note: S3 bucket names must be globally unique, lowercase, and can't contain spaces)",
+                    "requires_input": True,
+                    "input_type": "bucket_name"
+                }
+            
+            # Try to extract bucket name using agent chain
+            response = self.agent_chain.invoke({
+                "input": query,
+                "chat_history": self.memory.buffer
+            })
+            
+            # Update memory
+            self.memory.save_context({"input": query}, {"output": response["output"]})
+            
+            return {
+                "agent": "s3_creator",
+                "answer": response["output"]
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in S3 bucket creator agent: {str(e)}")
+            return {
+                "agent": "s3_creator",
+                "answer": "I encountered an error processing your S3 bucket creation request. Please provide a valid bucket name following AWS naming rules.",
+                "error": str(e)
+            }
+
+# Lambda Function Creator Agent
+class LambdaFunctionCreatorAgent:
+    """Agent specialized in creating Lambda functions"""
+    
+    def __init__(self):
+        # Initialize LLM and tools
+        self.llm = BedrockLLMFactory.create_llm(temperature=0.1)
+        self.lambda_tool = LambdaFunctionCreatorTool()
+        self.search_tool = DuckDuckGoSearchRun()
+        self.kg = KnowledgeGraphManager()
+        self.kg_tool = KnowledgeGraphTool(self.kg)
+        
+        # Setup memory
+        self.memory = ConversationBufferMemory(
+            return_messages=True,
+            memory_key="chat_history",
+            output_key="output"
+        )
+        
+        # Create tools list
+        self.tools = [
+            self.lambda_tool,
+            Tool(
+                name="lambda_best_practices",
+                func=self._get_lambda_best_practices,
+                description="Get best practices for Lambda function configuration and security"
+            ),
+            Tool(
+                name="web_search",
+                func=self.search_tool.run,
+                description="Search the web for information about AWS Lambda"
+            ),
+            self.kg_tool
+        ]
+        
+        # Setup prompt template
+        self.prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are an expert in AWS Lambda function creation and management.
+            Extract function names and runtimes from user requests and create properly configured Lambda functions.
+            Always follow AWS best practices for Lambda configuration."""),
+            MessagesPlaceholder(variable_name="chat_history"),
+            ("human", "{input}"),
+            MessagesPlaceholder(variable_name="agent_scratchpad")
+        ])
+        
+        # Create agent chain
+        self.planner = load_chat_planner(self.llm)
+        self.executor = load_agent_executor(
+            self.llm, 
+            self.tools, 
+            verbose=True
+        )
+        self.agent_chain = PlanAndExecute(
+            planner=self.planner,
+            executor=self.executor,
+            verbose=True
+        )
+    
+    def _get_lambda_best_practices(self, _):
+        """Return Lambda function best practices"""
+        return """Lambda Function Best Practices:
+1. Keep functions focused on a single task
+2. Minimize package size to improve cold start times
+3. Reuse execution context with global/static variables
+4. Configure memory based on function requirements
+5. Use environment variables for configuration
+6. Implement structured logging with contextual information
+7. Set appropriate timeouts based on function needs
+8. Use IAM roles with least privilege
+9. Implement error handling and retry mechanisms
+10. Configure reserved concurrency for critical functions"""
+    
+    def _extract_lambda_params(self, query):
+        """Extract Lambda function parameters from the query"""
+        # Use the LLM to extract the parameters
+        extraction_prompt = f"""
+        Extract the Lambda function name and runtime from the following query.
+        If any information is missing, indicate with "NOT_FOUND".
+        
+        Query: {query}
+        
+        Respond in this exact JSON format:
+        {{
+            "function_name": "extracted name or NOT_FOUND",
+            "runtime": "extracted runtime or NOT_FOUND"
+        }}
+        """
+        
+        extraction_chain = LLMChain(
+            llm=self.llm,
+            prompt=PromptTemplate(
+                template=extraction_prompt,
+                input_variables=[]
+            )
+        )
+        
+        result = extraction_chain.run({})
+        
+        try:
+            params = json.loads(result)
+            function_name = params.get("function_name")
+            runtime = params.get("runtime")
+            
+            if function_name == "NOT_FOUND":
+                function_name = None
+            
+            if runtime == "NOT_FOUND":
+                runtime = None
+                
+            return function_name, runtime
+        except:
+            return None, None
+    
+    def respond(self, query):
+        """Process query and create Lambda function"""
+        try:
+            # Try to extract function parameters
+            function_name, runtime = self._extract_lambda_params(query)
+            
+            # If we're missing both parameters
+            if not function_name and not runtime:
+                return {
+                    "agent": "lambda_creator",
+                    "answer": "I'll help you create a Lambda function. Please provide both a name for your function and the runtime you want to use (e.g., python3.12, nodejs20.x, java21).",
+                    "requires_input": True,
+                    "input_type": "lambda_details"
+                }
+            # If we're missing function name
+            elif not function_name:
+                return {
+                    "agent": "lambda_creator",
+                    "answer": f"I'll help you create a Lambda function with the {runtime} runtime. What would you like to name your function?",
+                    "requires_input": True,
+                    "input_type": "lambda_name",
+                    "runtime": runtime
+                }
+            # If we're missing runtime
+            elif not runtime:
+                return {
+                    "agent": "lambda_creator",
+                    "answer": f"I'll help you create a Lambda function named '{function_name}'. What runtime would you like to use? (e.g., python3.12, nodejs20.x, java21)",
+                    "requires_input": True,
+                    "input_type": "lambda_runtime",
+                    "function_name": function_name
+                }
+            
+            # Use agent chain for full response with parameters
+            response = self.agent_chain.invoke({
+                "input": f"Create a Lambda function named {function_name} with runtime {runtime}",
+                "chat_history": self.memory.buffer
+            })
+            
+            # Update memory
+            self.memory.save_context({"input": query}, {"output": response["output"]})
+            
+            return {
+                "agent": "lambda_creator",
+                "answer": response["output"]
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in Lambda function creator agent: {str(e)}")
+            return {
+                "agent": "lambda_creator",
+                "answer": "I encountered an error processing your Lambda function creation request. Please provide a valid function name and runtime.",
+                "error": str(e)
+            }
+
+# Master Control Program (MCP)
+class MasterControlProgram:
+    """Orchestrates the multi-agent system with a graph-based model"""
+    
+    def __init__(self):
+        # Initialize LLM for routing
+        self.llm = BedrockLLMFactory.create_llm(temperature=0)
+        
+        # Initialize knowledge graph
+        self.knowledge_graph = KnowledgeGraphManager()
+        
+        # Initialize specialized agents
+        self.domain_expert = DomainExpertAgent()
+        self.s3_creator = S3BucketCreatorAgent()
+        self.lambda_creator = LambdaFunctionCreatorAgent()
+        
+        # Create memory and state tracking
+        self.memory = ConversationBufferMemory(return_messages=True)
+        self.conversation_state = {
+            "current_agent": None,
+            "awaiting_input": False,
+            "input_type": None,
+            "partial_data": {}
+        }
+        
+        # Setup routing chain
+        self.router_prompt = PromptTemplate(
+            template="""You are the Master Control Program that routes queries to specialized agents.
+
+Based on the user query, determine which agent should handle it:
+1. domain_expert - For questions about Banking, Finance, Insurance, AWS services, or Terraform
+2. s3_creator - For requests to create or manage S3 buckets
+3. lambda_creator - For requests to create or manage Lambda functions
+
+User query: {query}
+
+Previous conversation:
+{history}
+
+Respond with ONLY ONE agent name (domain_expert, s3_creator, or lambda_creator):""",
+            input_variables=["query", "history"]
+        )
+        
+        self.router_chain = LLMChain(llm=self.llm, prompt=self.router_prompt)
+    
+    def _select_agent(self, query):
+        """Route query to appropriate agent using LLM-based routing"""
+        # Format conversation history
+        history = self.memory.buffer_as_str if hasattr(self.memory, "buffer_as_str") else ""
+        
+        # Run router chain
+        agent_name = self.router_chain.run(query=query, history=history).strip().lower()
+        
+        # Validate selection
+        if agent_name in ["domain_expert", "s3_creator", "lambda_creator"]:
+            logger.info(f"Selected agent: {agent_name}")
+            return agent_name
+        else:
+            logger.warning(f"Invalid agent selection: {agent_name}, defaulting to domain_expert")
+            return "domain_expert"
+    
+    def _get_agent_instance(self, agent_name):
+        """Get agent instance by name"""
+        if agent_name == "domain_expert":
+            return self.domain_expert
+        elif agent_name == "s3_creator":
+            return self.s3_creator
+        elif agent_name == "lambda_creator":
+            return self.lambda_creator
+        else:
+            raise ValueError(f"Unknown agent: {agent_name}")
+    
+    def process_query(self, query, user_id="default_user"):
+        """Process query through the appropriate agent"""
+        logger.info(f"MCP processing query: {query}")
+        
+        try:
+            # Check if awaiting specific input from previous interaction
+            if self.conversation_state["awaiting_input"]:
+                agent_type = self.conversation_state["current_agent"]
+                input_type = self.conversation_state["input_type"]
+                
+                # Reset state
+                self.conversation_state["awaiting_input"] = False
+                self.conversation_state["input_type"] = None
+                
+                # Get the appropriate agent
+                agent = self._get_agent_instance(agent_type)
+                
+                # Handle input based on expected type
+                if agent_type == "s3_creator" and input_type == "bucket_name":
+                    # Direct bucket name input
+                    response = self.s3_creator.s3_tool._run(query)
+                    return {
+                        "agent": "s3_creator",
+                        "answer": response
+                    }
+                elif agent_type == "lambda_creator":
+                    if input_type == "lambda_details":
+                        # Full details in follow-up
+                        response = agent.respond(query)
+                    elif input_type == "lambda_name":
+                        # Just need function name
+                        runtime = self.conversation_state["partial_data"].get("runtime")
+                        function_name = query.strip()
+                        
+                        # Create Lambda function with extracted parameters
+                        lambda_input = json.dumps({
+                            "function_name": function_name,
+                            "runtime": runtime
+                        })
+                        
+                        response = {
+                            "agent": "lambda_creator",
+                            "answer": self.lambda_creator.lambda_tool._run(lambda_input)
+                        }
+                    elif input_type == "lambda_runtime":
+                        # Just need runtime
+                        function_name = self.conversation_state["partial_data"].get("function_name")
+                        runtime = query.strip()
+                        
+                        # Create Lambda function with extracted parameters
+                        lambda_input = json.dumps({
+                            "function_name": function_name,
+                            "runtime": runtime
+                        })
+                        
+                        response = {
+                            "agent": "lambda_creator",
+                            "answer": self.lambda_creator.lambda_tool._run(lambda_input)
+                        }
+                    else:
+                        response = agent.respond(query)
+                else:
+                    response = agent.respond(query)
+            else:
+                # Select appropriate agent
+                agent_type = self._select_agent(query)
+                self.conversation_state["current_agent"] = agent_type
+                
+                # Get agent instance
+                agent = self._get_agent_instance(agent_type)
+                
+                # Process query with selected agent
+                response = agent.respond(query)
+            
+            # Update state if we need more input
+            if response.get("requires_input", False):
+                self.conversation_state["awaiting_input"] = True
+                self.conversation_state["input_type"] = response.get("input_type")
+                
+                # Store partial data
+                if "runtime" in response:
+                    self.conversation_state["partial_data"]["runtime"] = response["runtime"]
+                if "function_name" in response:
+                    self.conversation_state["partial_data"]["function_name"] = response["function_name"]
+            
+            # Update memory
+            self.memory.chat_memory.add_user_message(query)
+            self.memory.chat_memory.add_ai_message(response.get("answer", ""))
+            
+            # Add metadata about processing
+            response["meta"] = {
+                "processor": "mcp",
+                "agent": self.conversation_state["current_agent"],
+                "timestamp": datetime.datetime.now().isoformat()
+            }
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error in MCP: {str(e)}")
+            
+            # Error recovery
+            error_response = {
+                "agent": "mcp",
+                "answer": "I encountered an error processing your request. Please try rephrasing your query.",
+                "error": str(e),
+                "meta": {
+                    "error": True,
+                    "timestamp": datetime.datetime.now().isoformat()
+                }
+            }
+            
+            return error_response
+
+# Keep the original S3 bucket creation handler
+def create_s3_bucket_handler(event, context):
+    """
+    Handler function to create an S3 bucket with the name provided in the input.
+    """
+    try:
+        # Extract bucket name from the input event
+        if 'bucket_name' not in event:
+            return {
+                'statusCode': 400,
+                'body': json.dumps('Missing required parameter: bucket_name')
+            }
+        
+        # Convert to lowercase and add a random suffix to ensure uniqueness
+        base_name = event['bucket_name'].lower()
+        
+        # Replace any invalid characters (only lowercase letters, numbers, dots, and hyphens allowed)
+        base_name = re.sub(r'[^a-z0-9.-]', '-', base_name)
+        
+        # Generate a short random suffix
+        suffix = str(uuid.uuid4())[:8]
+        bucket_name = f"{base_name}-{suffix}"
+        
+        # Ensure name length is valid (3-63 characters)
+        if len(bucket_name) > 63:
+            bucket_name = bucket_name[:54] + "-" + suffix  # Truncate and add suffix
+        
+        if len(bucket_name) < 3:
+            bucket_name = f"bucket-{base_name}-{suffix}"  # Prefix if too short
+        
+        # Create S3 client
+        s3_client = boto3.client('s3')
+        region = boto3.session.Session().region_name
+        
+        # Create the bucket
+        logger.info(f"Creating bucket: {bucket_name}")
+        
+        # The create_bucket API is different for us-east-1
+        if region == 'us-east-1':
+            response = s3_client.create_bucket(Bucket=bucket_name)
+        else:
+            response = s3_client.create_bucket(
+                Bucket=bucket_name,
+                CreateBucketConfiguration={
+                    'LocationConstraint': region
+                }
+            )
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': f"Successfully created bucket",
+                'bucket_name': bucket_name
+            })
+        }
+    
+    except ClientError as e:
+        error_message = e.response['Error']['Message']
+        logger.error(f"Error creating bucket: {error_message}")
+        
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f"Error creating bucket: {error_message}")
+        }
+    
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f"Unexpected error: {str(e)}")
+        }
+
+# Keep the original Lambda function creation handler
+def create_lambda_function_handler(event, context):
+    """
+    Handler function to create a Lambda function with the name and runtime provided.
+    """
+    try:
+        # Extract parameters from the input event
+        if 'function_name' not in event:
+            return {
+                'statusCode': 400,
+                'body': json.dumps('Missing required parameter: function_name')
+            }
+        
+        if 'runtime' not in event:
+            return {
+                'statusCode': 400,
+                'body': json.dumps('Missing required parameter: runtime')
+            }
+        
+        function_name = event['function_name']
+        runtime = event['runtime']
+        architecture = event.get('architecture', 'x86_64')
+        
+        # Create Lambda client
+        lambda_client = boto3.client('lambda')
+        
+        # Create IAM client to setup role if needed
+        iam_client = boto3.client('iam')
+        
+        # Basic default code for the function (language-specific)
+        handler = 'index.lambda_handler'
+        function_code = DEFAULT_PYTHON_LAMBDA_CODE
+        
+        # Role needed for Lambda execution
+        role_name = f"lambda-basic-execution-{function_name}"
+        
+        # Create or get IAM role for Lambda
+        try:
+            # Try to create a new role
+            assume_role_policy = {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {
+                            "Service": "lambda.amazonaws.com"
+                        },
+                        "Action": "sts:AssumeRole"
+                    }
+                ]
+            }
+            
+            role_response = iam_client.create_role(
+                RoleName=role_name,
+                AssumeRolePolicyDocument=json.dumps(assume_role_policy)
+            )
+            
+            # Attach basic Lambda execution policy
+            iam_client.attach_role_policy(
+                RoleName=role_name,
+                PolicyArn='arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+            )
+            
+            # Need to wait for role to propagate
+            import time
+            time.sleep(10)
+            
+            role_arn = role_response['Role']['Arn']
+            
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'EntityAlreadyExists':
+                # Role already exists, get its ARN
+                role_response = iam_client.get_role(RoleName=role_name)
+                role_arn = role_response['Role']['Arn']
+            else:
+                raise
+        
+        # Prepare the function code (as a ZIP file in memory)
+        import io
+        import zipfile
+        
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            zip_file.writestr('index.py', function_code)
+        
+        zip_buffer.seek(0)
+        zip_code = zip_buffer.read()
+        
+        # Create the Lambda function
+        logger.info(f"Creating Lambda function: {function_name} with runtime {runtime} on {architecture}")
+        
+        response = lambda_client.create_function(
+            FunctionName=function_name,
+            Runtime=runtime,
+            Role=role_arn,
+            Handler=handler,
+            Code={
+                'ZipFile': zip_code
+            },
+            Description=f"Lambda function created via multi-agent system",
+            Timeout=30,
+            MemorySize=128,
+            Publish=True,
+            Architectures=[architecture]
+        )
+        
+        # Return success response
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': "Successfully created Lambda function",
+                'function_name': function_name,
+                'runtime': runtime,
+                'architecture': architecture,
+                'function_arn': response['FunctionArn']
+            })
+        }
+    
+    except ClientError as e:
+        error_message = e.response['Error']['Message']
+        logger.error(f"Error creating Lambda function: {error_message}")
+        
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f"Error creating Lambda function: {error_message}")
+        }
+    
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f"Unexpected error: {str(e)}")
+        }
+
+# Main Lambda handler
+def lambda_handler(event, context):
+    """
+    AWS Lambda handler for the LangChain-based multi-agent system with MCP
+    """
+    try:
+        logger.info(f"Received event: {event}")
+        
+        # Extract query from the event
+        if 'prompt' not in event:
+            return {
+                'statusCode': 400,
+                'body': json.dumps('Missing required parameter: prompt')
+            }
+        
+        query = event['prompt']
+        user_id = event.get('user_id', 'default_user')
+        
+        # Process through the MCP
+        mcp = MasterControlProgram()
+        response = mcp.process_query(query, user_id)
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps(response)
+        }
+    
+    except Exception as e:
+        logger.error(f"Error in multi-agent system: {str(e)}")
+        
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f"Error processing request: {str(e)}")
+        }
+
+# Local CLI for testing
+if __name__ == "__main__":
+    # Initialize the MCP
+    mcp = MasterControlProgram()
+    
+    print("LangChain Multi-Agent System with MCP and Graph-Based Knowledge")
+    print("Type 'exit' to quit")
+    print("Type 'visualize' to generate a visualization of the knowledge graph")
+    
+    while True:
+        user_input = input("\nYour query: ")
+        
+        if user_input.lower() == 'exit':
+            break
+        
+        if user_input.lower() == 'visualize':
+            # Generate knowledge graph visualization
+            try:
+                print("Generating knowledge graph visualization...")
+                net = mcp.knowledge_graph.visualize()
+                net.show("knowledge_graph.html")
+                print("Knowledge graph visualization saved to knowledge_graph.html")
+            except Exception as e:
+                print(f"Error generating visualization: {str(e)}")
+            continue
+        
+        # Process the query
+        result = mcp.process_query(user_input)
+        
+        # Display the response
+        agent_name = result.get('agent', 'unknown').upper()
+        answer = result.get('answer', 'No response generated')
+        
+        print(f"\n[{agent_name} Agent]: {answer}")
+        
+        if 'error' in result:
+            print(f"\nError: {result['error']}")
